@@ -1,0 +1,118 @@
+# Робот «Картографии»: каждые 30 секунд смотрит тревоги (alerts.in.ua) и шлёт в ntfy,
+# даже когда сайт закрыт. Работает сам — ничего нажимать не нужно.
+on:
+  schedule:
+    - cron: '*/15 * * * *'   # перезапуск-страховка; сам робот работает ~5,8 часа подряд
+  workflow_dispatch: {}
+
+concurrency:
+  group: trevoga-ntfy
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    steps:
+      - name: Следить за тревогами
+        run: |
+          cat > watch.mjs <<'EOF'
+          // ===== НАСТРОЙКА: твои районы (как в Картографии: "Область|Район") =====
+          const MY = [
+            "Київська область|Білоцерківський район",
+            "м. Київ|Солом'янський район",
+          ];
+          // =========================================================================
+          const NTFY = 'https://ntfy.sh';
+          const PREFIX = 'kartografiya-ua-';
+          const SRC = 'https://api.alerts.in.ua/v3/alerts/active.md';
+          const RUN_MS = 345 * 60 * 1000, STEP = 30000;
+          const norm = s => s.replace(/[’ʼ`]/g, "'").replace(/\s+/g, ' ').trim();
+          function topic(key){ let h = 2166136261; for(const ch of key){ h ^= ch.codePointAt(0); h = Math.imul(h, 16777619) >>> 0; } return PREFIX + h.toString(36); }
+          const keys = MY.map(norm);
+
+          // разбор сводки: { "Область|Район": "red"|"yellow" }, плюс области/город целиком
+          function parse(md){
+            const lv = {}, whole = {};
+            let obl = null;
+            for(const line of md.split('\n')){
+              const ob = line.match(/\(((?:[^()]*област[ьі])|м\. Київ|м\. Севастополь)\)/);
+              if(ob && /\*\*/.test(line)){ obl = norm(ob[1]); }
+              if(!obl) continue;
+              const found = [];
+              let m; const re = /\(([^()\[\]]+?)\)\s*\[\s*(red|yellow)/gi;
+              while((m = re.exec(line))) found.push([m[1], m[2]]);
+              const reG = /(red|yellow)\s*(?:\([^)]*\))?\s*:\s*([^;\n]+)/gi;
+              while((m = reG.exec(line))){ const l = m[1]; const rn = /\(([^()]+)\)/g; let k; while((k = rn.exec(m[2]))) found.push([k[1], l]); }
+              for(const [nm, l] of found){
+                let n = norm(nm);
+                if(/област|^м\. /.test(n)){ whole[n] = l.toLowerCase(); continue; }
+                if(/громада/.test(n)) continue;
+                if(!/район$/.test(n)) n += ' район';
+                if(n === 'Новомосковський район') n = 'Самарівський район';
+                lv[obl + '|' + n] = l.toLowerCase();
+              }
+              // область/город в тревоге без списка районов — значит целиком
+              if(/air raid alert|тривог/i.test(line) && !found.length && /\*\*/.test(line) && !(obl in whole)) whole[obl] = 'red';
+            }
+            return { lv, whole };
+          }
+          function levelFor(key, p){
+            const o = key.split('|')[0];
+            if(p.lv[key]) return p.lv[key];
+            if(p.whole[o]) return p.whole[o];
+            return null; // нет тревоги
+          }
+          async function send(key, level){
+            const [o, n] = key.split('|');
+            let title, priority, tags;
+            if(!level){ title = '🟢 Відбій тривоги'; priority = 3; tags = ['green_circle']; }
+            else if(level === 'yellow'){ title = '🟨 Повітряна тривога - жовтий рівень (БПЛА)'; priority = 4; tags = ['yellow_square']; }
+            else { title = '🛑 Повітряна тривога - червоний рівень (БАЛІСТИКА)'; priority = 5; tags = ['octagonal_sign']; }
+            try{
+              const r = await fetch(NTFY, { method:'POST', body: JSON.stringify({ topic: topic(key), title, message: '📍 ' + n + ', ' + o, priority, tags }) });
+              console.log(new Date().toISOString(), key, level || 'відбій', r.status);
+            }catch(e){ console.log('ntfy error', e.message); }
+          }
+          const t0 = Date.now();
+          let prev = null;
+          while(Date.now() - t0 < RUN_MS){
+            try{
+              const r = await fetch(SRC, { headers: { 'User-Agent': 'kartografiya-alerts' }, cache: 'no-store' });
+              if(r.ok){
+                const p = parse(await r.text());
+                const cur = {};
+                for(const k of keys) cur[k] = levelFor(k, p);
+                if(prev){
+                  for(const k of keys){
+                    const was = prev[k], is = cur[k];
+                    if(was === is) continue;
+                    if(is && (!was || (was === 'yellow' && is === 'red'))) await send(k, is);
+                    else if(!is && was) await send(k, null);
+                  }
+                } else console.log('старт, сейчас:', JSON.stringify(cur));
+                prev = cur;
+              } else console.log('alerts.in.ua', r.status);
+            }catch(e){ console.log('ошибка', e.message); }
+            await new Promise(res => setTimeout(res, STEP));
+          }
+          EOF
+          node watch.mjs
+
+  # раз в неделю «трогаем» репозиторий, чтобы GitHub не выключил робота через 60 дней
+  keepalive:
+    if: github.event.schedule == '*/15 * * * *'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Keepalive
+        run: |
+          if [ "$(date -u +%u%H%M | cut -c1-3)" = "100" ] && [ "$(date -u +%M)" -lt 15 ]; then
+            date -u > keepalive.txt
+            git config user.name "kartografiya-bot"
+            git config user.email "bot@users.noreply.github.com"
+            git add keepalive.txt && git commit -m "keepalive" && git push || true
+          fi
