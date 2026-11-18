@@ -55,8 +55,8 @@ jobs:
                 if(n === 'Новомосковський район') n = 'Самарівський район';
                 lv[obl + '|' + n] = l.toLowerCase();
               }
-              // область/город в тревоге без списка районов — значит целиком
-              if(/air raid alert|тривог/i.test(line) && !found.length && /\*\*/.test(line) && !(obl in whole)) whole[obl] = 'red';
+              // область/город в тревоге без списка районов — значит целиком (уровень ищем в тексте строки)
+              if(/air raid alert|тривог/i.test(line) && !found.length && /\*\*/.test(line) && !(obl in whole)) whole[obl] = /yellow|drone|жовт/i.test(line) ? 'yellow' : 'red';
             }
             return { lv, whole };
           }
@@ -79,6 +79,10 @@ jobs:
           }
           const t0 = Date.now();
           let prev = null;
+          // «эпизод» тревоги по району: шлём 1 раз начало, 1 раз переход в червоний, 1 раз відбій.
+          // Изменение должно продержаться 2 проверки подряд (~1 мин), чтобы не было дёрганья.
+          const ep = {};      // key -> { on:true, red:bool }
+          const cand = {};    // key -> { val, n }
           while(Date.now() - t0 < RUN_MS){
             try{
               const r = await fetch(SRC, { headers: { 'User-Agent': 'kartografiya-alerts' }, cache: 'no-store' });
@@ -88,12 +92,19 @@ jobs:
                 for(const k of keys) cur[k] = levelFor(k, p);
                 if(prev){
                   for(const k of keys){
-                    const was = prev[k], is = cur[k];
-                    if(was === is) continue;
-                    if(is && (!was || (was === 'yellow' && is === 'red'))) await send(k, is);
-                    else if(!is && was) await send(k, null);
+                    const is = cur[k];
+                    const c = cand[k] && cand[k].val === is ? cand[k] : (cand[k] = { val: is, n: 0 });
+                    c.n++;
+                    if(c.n < 2) continue; // ждём подтверждения
+                    const e = ep[k];
+                    if(is && !e){ ep[k] = { on:true, red: is === 'red' }; await send(k, is); }
+                    else if(is && e && is === 'red' && !e.red){ e.red = true; await send(k, 'red'); }
+                    else if(!is && e){ delete ep[k]; await send(k, null); }
                   }
-                } else console.log('старт, сейчас:', JSON.stringify(cur));
+                } else {
+                  console.log('старт, сейчас:', JSON.stringify(cur));
+                  for(const k of keys) if(cur[k]) ep[k] = { on:true, red: cur[k] === 'red' };
+                }
                 prev = cur;
               } else console.log('alerts.in.ua', r.status);
             }catch(e){ console.log('ошибка', e.message); }
