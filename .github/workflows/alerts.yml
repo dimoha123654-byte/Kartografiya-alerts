@@ -1,5 +1,3 @@
-name: Тривоги в ntfy
-
 # Робот «Картографии»: каждые 30 секунд смотрит тревоги (alerts.in.ua) и шлёт в ntfy,
 # даже когда сайт закрыт. Работает сам — ничего нажимать не нужно.
 on:
@@ -38,7 +36,7 @@ jobs:
 
           // разбор сводки: { "Область|Район": "red"|"yellow" }, плюс области/город целиком
           function parse(md){
-            const lv = {}, whole = {};
+            const lv = {}, whole = {}, wholeCand = {}, hasAreas = {};
             let obl = null;
             // берём ТОЛЬКО раздел «3. CURRENT WARNING STATUS» (активные тревоги).
             // Ниже в сводке идут история, закончившиеся тревоги и статистика — их читать нельзя.
@@ -63,10 +61,13 @@ jobs:
                 if(!/район$/.test(n)) n += ' район';
                 if(n === 'Новомосковський район') n = 'Самарівський район';
                 lv[obl + '|' + n] = l.toLowerCase();
+                hasAreas[obl] = true;
               }
               // область/город в тревоге без списка районов — значит целиком (уровень ищем в тексте строки)
-              if(/in effect|ongoing|триває|діє/i.test(line) && !found.length && /\*\*/.test(line) && !(obl in whole)) whole[obl] = /yellow|drone|жовт/i.test(line) ? 'yellow' : 'red';
+              if(/in effect|ongoing|триває|діє/i.test(line) && !found.length && /\*\*/.test(line) && !(obl in wholeCand)) wholeCand[obl] = /yellow|drone|жовт/i.test(line) ? 'yellow' : 'red';
             }
+            // «вся область/город» — только если у неё вообще не перечислены районы (иначе тревога лишь в части районов)
+            for(const o in wholeCand) if(!hasAreas[o] && !(o in whole)) whole[o] = wholeCand[o];
             return { lv, whole };
           }
           function levelFor(key, p){
@@ -137,4 +138,3 @@ jobs:
             git config user.email "bot@users.noreply.github.com"
             git add keepalive.txt && git commit -m "keepalive" && git push || true
           fi
-          
